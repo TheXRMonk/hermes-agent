@@ -293,20 +293,22 @@ class CLIStatusBarMixin:
         except Exception:
             pass
 
-        if not agent:
-            return snapshot
+        cost_state = agent or getattr(self, "_restored_session_cost", None)
 
         # Display the existing accounting result; never reprice tokens during repaint.
         from cli import CLI_CONFIG
         display = CLI_CONFIG.get("display") if isinstance(CLI_CONFIG, dict) else None
-        if isinstance(display, dict) and display.get("show_cost", False):
-            amount = _finite(getattr(agent, "session_estimated_cost_usd", None))
-            status = getattr(agent, "session_cost_status", "unknown")
+        if cost_state is not None and isinstance(display, dict) and display.get("show_cost", False):
+            amount = _finite(getattr(cost_state, "session_estimated_cost_usd", None))
+            status = getattr(cost_state, "session_cost_status", "unknown")
             if status in ("estimated", "included") and amount is not None and amount >= 0:
                 snapshot["cost_label"] = (
                     "cost included" if status == "included" and amount == 0 else f"~${amount:.4f}")
             else:
                 snapshot["cost_label"] = "cost unknown"
+
+        if not agent:
+            return snapshot
 
         for key in _AGENT_COUNTERS:
             snapshot[key] = getattr(agent, key, 0) or 0
