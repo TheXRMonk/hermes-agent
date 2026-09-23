@@ -427,6 +427,64 @@ class CLIAgentSetupMixin:
         self._restore_session_yolo(session_meta, quiet=quiet)
         self._restore_session_model(session_meta, quiet=quiet)
 
+    def _restore_session_cost(self) -> None:
+        """Seed the CLI accumulator, without writing historical usage back as deltas."""
+        if not self._session_db:
+            return
+        from cli import logger
+        try:
+            import json
+            db = self._session_db
+            lineage = db.get_compression_lineage(self.session_id)
+            rows_by_id = {sid: db.get_session(sid) for sid in lineage}
+            # The deletion preview is a read-only, recursive delegate-marker lookup.
+            # It is a candidate superset: inherited markers on forks must be excluded.
+            candidates = {sid for parent in lineage for sid in db.get_session_delete_targets(parent)}
+            pending = {sid: db.get_session(sid) for sid in candidates - rows_by_id.keys()}
+            while pending:
+                accepted = []
+                for sid, row in pending.items():
+                    if not row or row.get("parent_session_id") not in rows_by_id:
+                        continue
+                    parent = row["parent_session_id"]
+                    config = row.get("model_config") or {}
+                    if isinstance(config, str):
+                        config = json.loads(config)
+                    if config.get("_branched_from") == parent or config.get("_reset_from") == parent:
+                        continue
+                    if (config.get("_delegate_from") == parent or
+                            db._is_compression_child_row(row)):
+                        accepted.append(sid)
+                if not accepted:
+                    break
+                for sid in accepted:
+                    rows_by_id[sid] = pending.pop(sid)
+            rows = list(rows_by_id.values())
+            # Empty compression continuations have no pricing provenance yet.
+            usage_fields = ("input_tokens", "output_tokens", "cache_read_tokens",
+                            "cache_write_tokens", "reasoning_tokens", "api_call_count")
+            rows = [row for row in rows if row and (
+                row.get("estimated_cost_usd") is not None or
+                any(row.get(key) for key in usage_fields))]
+            from types import SimpleNamespace
+            baseline = SimpleNamespace(session_estimated_cost_usd=0.0,
+                                       session_cost_status="unknown", session_cost_source="none")
+            if rows:
+                baseline.session_estimated_cost_usd = sum(
+                    float(row.get("estimated_cost_usd") or 0) for row in rows)
+                statuses = {row.get("cost_status") or "unknown" for row in rows}
+                sources = {row.get("cost_source") or "none" for row in rows}
+                baseline.session_cost_status = (
+                    "unknown" if statuses - {"estimated", "included"} else
+                    "estimated" if "estimated" in statuses else "included")
+                baseline.session_cost_source = sources.pop() if len(sources) == 1 else "mixed"
+            self._restored_session_cost = baseline
+            if self.agent is not None:
+                for name, value in vars(baseline).items():
+                    setattr(self.agent, name, value)
+        except Exception as exc:
+            logger.warning("Could not restore session cost for %s: %s", self.session_id, exc)
+
     def _reopen_session(self) -> None:
         """Clear ended_at so the resumed session is active again (best effort)."""
         try:
@@ -597,6 +655,7 @@ class CLIAgentSetupMixin:
             except Exception:
                 pass
             self._active_agent_route_signature = _route_signature(effective_model, runtime)
+            self._restore_session_cost()
 
             # Force-create DB row on /title intent, then apply title.
             if self._pending_title and self._session_db:
@@ -664,6 +723,7 @@ class CLIAgentSetupMixin:
             self._resume_history_error = resume_limit_error
             self._console_print(f"[bold red]Cannot resume session:[/] {resume_limit_error}")
             return False
+        self._restore_session_cost()
         restored, display_history = self._session_db.get_resume_conversations(self.session_id)
         accent_color = _accent_hex()
         if not restored:

@@ -525,6 +525,7 @@ class CLISessionMixin:
         self.conversation_history = []
         self._pending_title = None
         self._resumed = False
+        self._restored_session_cost = None
         # An explicit -m/--model was for the previous session only.
         self._explicit_model_override = False
         self.reasoning_config = _parse_reasoning_config(
