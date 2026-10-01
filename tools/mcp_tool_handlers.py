@@ -56,7 +56,34 @@ def _tool_is_read_only(server_name: str, tool_name: str) -> bool:
     return _core._tool_read_only_hints.get(_resolve_server_key(server_name), {}).get(tool_name) is True
 
 
-def _trust_gate_check(server_name: str, tool_name: str) -> Optional[str]:
+def _mutation_preview(server_name: str, tool_name: str, args: Optional[dict]) -> str:
+    """Render the supplied payload, without fetching or inventing issue metadata."""
+    from agent.redact import redact_sensitive_text
+
+    payload = args if args is not None else {}
+    actions = {
+        "jira_update_issue": "Update Jira issue",
+        "jira_create_issue": "Create Jira issue",
+        "jira_delete_issue": "Delete Jira issue",
+        "jira_move_issue": "Move Jira issue",
+    }
+    lines = [f"Action: {actions.get(tool_name, tool_name)}",
+             f"Server: {server_name}", f"Tool: {tool_name}"]
+    target = payload.get("issue_key") or payload.get("issue_id")
+    if target:
+        label = "Source" if tool_name == "jira_move_issue" else "Target"
+        lines.append(f"{label}: {target}")
+    if tool_name == "jira_move_issue":
+        lines.append(f"Destination: {payload.get('target_project_key', '(not supplied)')}")
+    if tool_name == "jira_delete_issue":
+        lines.append("Warning: deletes this issue. Review subtask options below.")
+    lines.append("Exact requested arguments (secrets redacted):")
+    lines.append(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
+    lines.append("Approve this action once, or deny. No session-wide permission is granted.")
+    return redact_sensitive_text("\n".join(lines), force=True, redact_url_credentials=True)
+
+
+def _trust_gate_check(server_name: str, tool_name: str, args: Optional[dict] = None) -> Optional[str]:
     """Approval gate for write-capable tools on ``trust: untrusted`` servers. None to proceed,
     else a ``tool_error``. Fail-closed: approval-system errors block."""
     from tools.mcp_tool_scope import _server_key
@@ -67,10 +94,8 @@ def _trust_gate_check(server_name: str, tool_name: str) -> Optional[str]:
     try:  # lazy: tools.approval routes the prompt to whichever surface owns the session
         from tools.approval_prompt import request_elicitation_consent
         answer = request_elicitation_consent(
-            f"MCP tool '{tool_name}' on UNTRUSTED server '{server_name}' wants to run. This tool is write-capable "
-            f"(no readOnlyHint=true annotation) and may modify external state.",
-            f"Server '{server_name}' is configured 'trust: untrusted'. "
-            f"Approve to run '{tool_name}' once, or deny to block it.",
+            _mutation_preview(server_name, tool_name, args),
+            f"Approve external change: {tool_name}",
             surface=f"mcp-trust/{server_name}", title=f"MCP server '{server_name}' is asking")
     except Exception as exc:
         logger.error("MCP trust gate: approval check failed for %s.%s: %s", server_name, tool_name, exc, exc_info=True)
@@ -558,7 +583,7 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
 
     def _handler(args: dict, **kwargs) -> str:
         # Security boundary: untrusted-server write tools need approval before ANY transport work (incl. lazy spawn).
-        error = _trust_gate_check(server_name, tool_name) or _check_circuit_breaker(server_name)
+        error = _trust_gate_check(server_name, tool_name, args) or _check_circuit_breaker(server_name)
         if error is not None:
             return error
         server, error = _acquire_call_server(server_name, tool_timeout)
